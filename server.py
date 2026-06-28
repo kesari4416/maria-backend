@@ -155,6 +155,7 @@ def send_submission_email(submission: dict, photos: Optional[List[tuple]] = None
         <h3>Client Details</h3>
         <table style="border-collapse:collapse;width:100%">
           <tr><td style="padding:6px;border:1px solid #e5e5e5"><strong>Client Name</strong></td><td style="padding:6px;border:1px solid #e5e5e5">{submission['client_name']}</td></tr>
+          <tr><td style="padding:6px;border:1px solid #e5e5e5"><strong>Role</strong></td><td style="padding:6px;border:1px solid #e5e5e5">{submission.get('client_role','') or '-'}</td></tr>
           <tr><td style="padding:6px;border:1px solid #e5e5e5"><strong>Company</strong></td><td style="padding:6px;border:1px solid #e5e5e5">{submission.get('client_company','')}</td></tr>
           <tr><td style="padding:6px;border:1px solid #e5e5e5"><strong>Mobile</strong></td><td style="padding:6px;border:1px solid #e5e5e5">{submission['client_mobile']}</td></tr>
           <tr><td style="padding:6px;border:1px solid #e5e5e5"><strong>Email</strong></td><td style="padding:6px;border:1px solid #e5e5e5">{submission.get('client_email','')}</td></tr>
