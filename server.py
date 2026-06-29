@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from typing import Optional, List
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
@@ -204,7 +204,7 @@ ALLOWED_STATUSES = [
     "Cancelled",
 ]
 CLIENT_ROLES = ["Engineer", "Plumber", "Electrician", "Mastri", "Other"]
-LOCATIONS = ["Nagercoil", "Monday Market", "Thingalnagar", "Tirunelveli", "Valliyoor"]
+LOCATIONS = ["Nagercoil", "Monday Market", "Valliyoor", "Thisayanvilai"]
 FOLLOWUP_RADIUS_METERS = int(os.environ.get("FOLLOWUP_RADIUS_METERS", "300"))
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -451,9 +451,26 @@ async def _build_timeline(original_id: str) -> List[dict]:
     ).sort("visit_number", 1).to_list(1000)
     return visits
 
+def _send_and_flag(sub_id: str, submission: dict, photos: List[tuple], timeline: Optional[List[dict]] = None):
+    """Sync function safe to run as a FastAPI BackgroundTask (runs in a worker thread)."""
+    try:
+        ok = send_submission_email(submission, photos=photos, timeline=timeline)
+    except Exception as e:
+        logger.exception(f"Background email crashed: {e}")
+        ok = False
+    # Update the DB flag synchronously using a fresh client (motor must run in the event loop, so use pymongo here).
+    try:
+        from pymongo import MongoClient
+        sync_client = MongoClient(os.environ["MONGO_URL"])
+        sync_client[os.environ["DB_NAME"]].submissions.update_one({"id": sub_id}, {"$set": {"email_sent": ok}})
+        sync_client.close()
+    except Exception as e:
+        logger.exception(f"Failed to update email_sent flag: {e}")
+
 # ---------- Field Worker: Submit (initial visit) ----------
 @api_router.post("/field/submit")
 async def submit_field_report(
+    background_tasks: BackgroundTasks,
     client_name: str = Form(...),
     client_company: str = Form(""),
     client_mobile: str = Form(...),
@@ -508,15 +525,15 @@ async def submit_field_report(
         "created_at": now,
     }
     await db.submissions.insert_one({**submission})
-    email_ok = send_submission_email(submission, photos=photos)
-    await db.submissions.update_one({"id": sub_id}, {"$set": {"email_sent": email_ok}})
+    background_tasks.add_task(_send_and_flag, sub_id, submission, photos)
 
-    return {"id": sub_id, "visit_number": 1, "email_sent": email_ok, "photo_count": len(photos), "message": "Report submitted successfully"}
+    return {"id": sub_id, "visit_number": 1, "email_queued": True, "photo_count": len(photos), "message": "Report submitted successfully"}
 
 # ---------- Field Worker: Follow-up visit ----------
 @api_router.post("/field/follow-up/{submission_id}")
 async def submit_follow_up(
     submission_id: str,
+    background_tasks: BackgroundTasks,
     status: str = Form(...),
     notes: str = Form(""),
     latitude: Optional[str] = Form(None),
@@ -619,13 +636,12 @@ async def submit_follow_up(
     await db.submissions.insert_one({**submission})
 
     timeline = await _build_timeline(original_id)
-    email_ok = send_submission_email(submission, photos=photos, timeline=timeline)
-    await db.submissions.update_one({"id": sub_id}, {"$set": {"email_sent": email_ok}})
+    background_tasks.add_task(_send_and_flag, sub_id, submission, photos, timeline)
 
     return {
         "id": sub_id,
         "visit_number": next_visit,
-        "email_sent": email_ok,
+        "email_queued": True,
         "photo_count": len(photos),
         "distance_from_original_m": submission["distance_from_original_m"],
         "message": "Follow-up submitted successfully",
