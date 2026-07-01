@@ -38,7 +38,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # ---------- App ----------
-app = FastAPI(title="Maria Glass & Plywood API")
+app = FastAPI(title="Maria Glass & Plywoods API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer(auto_error=False)
 
@@ -90,7 +90,7 @@ def send_submission_email(submission: dict, photos: Optional[List[tuple]] = None
     username = os.environ["SMTP_USERNAME"]
     password = os.environ["SMTP_APP_PASSWORD"]
     to_email = os.environ["COMPANY_EMAIL"]
-    company = os.environ.get("COMPANY_NAME", "Maria Glass & Plywood")
+    company = os.environ.get("COMPANY_NAME", "Maria Glass & Plywoods")
 
     visit_num = submission.get("visit_number", 1)
     status = submission.get("status", "Site Visited")
@@ -226,6 +226,7 @@ class CreateWorkerRequest(BaseModel):
     name: str
     email: EmailStr
     password: str = Field(min_length=4)
+    role: Optional[str] = "field_worker"
 
 class ContactRequest(BaseModel):
     name: str
@@ -258,12 +259,27 @@ async def login(payload: LoginRequest):
 async def me(user: dict = Depends(get_current_user)):
     return user
 
-# ---------- Admin: Field Worker Management ----------
+# ---------- Admin: Worker Management (field_worker + shop_worker) ----------
+WORKER_ROLES = {"field_worker", "shop_worker"}
+
+def require_admin_or_shop(user: dict = Depends(get_current_user)) -> dict:
+    if user["role"] not in ("admin", "shop_worker"):
+        raise HTTPException(status_code=403, detail="Admin or Shop Worker access required")
+    return user
+
 @api_router.post("/admin/workers", response_model=UserOut)
-async def create_worker(payload: CreateWorkerRequest, _: dict = Depends(require_admin)):
+async def create_worker(payload: CreateWorkerRequest, user: dict = Depends(get_current_user)):
+    if user["role"] not in ("admin", "shop_worker"):
+        raise HTTPException(status_code=403, detail="Admin or Shop Worker access required")
     email = payload.email.lower().strip()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already exists")
+    role = (payload.role or "field_worker").strip()
+    if role not in WORKER_ROLES:
+        raise HTTPException(status_code=400, detail=f"role must be one of: {', '.join(WORKER_ROLES)}")
+    # Shop workers can only create field workers
+    if user["role"] == "shop_worker" and role != "field_worker":
+        raise HTTPException(status_code=403, detail="Shop workers can only create field workers")
     uid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     doc = {
@@ -271,27 +287,39 @@ async def create_worker(payload: CreateWorkerRequest, _: dict = Depends(require_
         "name": payload.name.strip(),
         "email": email,
         "password_hash": hash_password(payload.password),
-        "role": "field_worker",
+        "role": role,
         "created_at": now,
     }
     await db.users.insert_one(doc)
-    return UserOut(id=uid, name=doc["name"], email=email, role="field_worker", created_at=now)
+    return UserOut(id=uid, name=doc["name"], email=email, role=role, created_at=now)
 
 @api_router.get("/admin/workers", response_model=List[UserOut])
-async def list_workers(_: dict = Depends(require_admin)):
-    workers = await db.users.find({"role": "field_worker"}, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(1000)
+async def list_workers(user: dict = Depends(get_current_user)):
+    if user["role"] == "admin":
+        query = {"role": {"$in": list(WORKER_ROLES)}}
+    elif user["role"] == "shop_worker":
+        query = {"role": "field_worker"}  # shop workers see only field workers they can manage
+    else:
+        raise HTTPException(status_code=403, detail="Access required")
+    workers = await db.users.find(query, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(1000)
     return [UserOut(**w) for w in workers]
 
 @api_router.delete("/admin/workers/{worker_id}")
-async def delete_worker(worker_id: str, _: dict = Depends(require_admin)):
-    res = await db.users.delete_one({"id": worker_id, "role": "field_worker"})
+async def delete_worker(worker_id: str, user: dict = Depends(get_current_user)):
+    if user["role"] == "admin":
+        allowed = {"$in": list(WORKER_ROLES)}
+    elif user["role"] == "shop_worker":
+        allowed = "field_worker"  # shop workers cannot delete other shop workers
+    else:
+        raise HTTPException(status_code=403, detail="Access required")
+    res = await db.users.delete_one({"id": worker_id, "role": allowed})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Worker not found")
     return {"ok": True}
 
-# ---------- Admin: View Submissions ----------
+# ---------- Admin/Shop: View Submissions ----------
 @api_router.get("/admin/submissions")
-async def list_submissions(_: dict = Depends(require_admin)):
+async def list_submissions(_: dict = Depends(require_admin_or_shop)):
     items = await db.submissions.find({}, {"_id": 0, "photo_data": 0}).sort("created_at", -1).to_list(1000)
     return items
 
@@ -406,7 +434,7 @@ async def export_submissions(format: str = "excel", _: dict = Depends(require_ad
             ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ]))
         story = [
-            Paragraph("Maria Glass & Plywood — Field Submissions", title_style),
+            Paragraph("Maria Glass & Plywoods — Field Submissions", title_style),
             Paragraph(f"Exported on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · {len(items)} record(s)", meta_style),
             Spacer(1, 12),
             table,
@@ -697,6 +725,83 @@ async def list_rejected(_: dict = Depends(require_admin)):
     items = await db.rejected_attempts.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return items
 
+# ---------- Admin: Add a note to a specific visit ----------
+class AdminNoteIn(BaseModel):
+    text: str
+    status: Optional[str] = None
+
+@api_router.post("/visit/{visit_id}/note")
+async def add_visit_note(visit_id: str, payload: AdminNoteIn, user: dict = Depends(get_current_user)):
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Note text is required")
+    if len(text) > 2000:
+        raise HTTPException(status_code=400, detail="Note is too long (max 2000 characters)")
+    status = (payload.status or "").strip()
+    if status and status not in ALLOWED_STATUSES:
+        raise HTTPException(status_code=400, detail=f"status must be one of: {', '.join(ALLOWED_STATUSES)}")
+    visit = await db.submissions.find_one({"id": visit_id}, {"_id": 0, "photo_data": 0})
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found")
+    # Permission:
+    #   admin & shop_worker → any submission
+    #   field_worker → only their own chain
+    if user["role"] == "field_worker":
+        original_id = visit.get("original_submission_id") or visit["id"]
+        owned = await db.submissions.find_one({
+            "$or": [{"id": original_id}, {"original_submission_id": original_id}],
+            "worker_id": user["id"],
+        }, {"_id": 0})
+        if not owned:
+            raise HTTPException(status_code=403, detail="Not your submission")
+    elif user["role"] not in ("admin", "shop_worker"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    note = {
+        "id": str(uuid.uuid4()),
+        "text": text,
+        "status": status or None,
+        "author_id": user["id"],
+        "author_name": user.get("name", user["email"]),
+        "author_email": user["email"],
+        "author_role": user["role"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    update_ops = {"$push": {"admin_notes": note}}
+    if status:
+        update_ops["$set"] = {"status": status}
+    await db.submissions.update_one({"id": visit_id}, update_ops)
+    updated = await db.submissions.find_one({"id": visit_id}, {"_id": 0, "photo_data": 0})
+    return {
+        "visit_id": visit_id,
+        "admin_notes": updated.get("admin_notes", []),
+        "status": updated.get("status"),
+        "status_updated": bool(status),
+    }
+
+@api_router.delete("/visit/{visit_id}/note/{note_id}")
+async def delete_visit_note(visit_id: str, note_id: str, user: dict = Depends(get_current_user)):
+    visit = await db.submissions.find_one({"id": visit_id}, {"_id": 0, "photo_data": 0})
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found")
+    if user["role"] == "field_worker":
+        original_id = visit.get("original_submission_id") or visit["id"]
+        owned = await db.submissions.find_one({
+            "$or": [{"id": original_id}, {"original_submission_id": original_id}],
+            "worker_id": user["id"],
+        }, {"_id": 0})
+        if not owned:
+            raise HTTPException(status_code=403, detail="Not your submission")
+    elif user["role"] not in ("admin", "shop_worker"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    res = await db.submissions.update_one(
+        {"id": visit_id},
+        {"$pull": {"admin_notes": {"id": note_id}}},
+    )
+    if res.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Note not found")
+    updated = await db.submissions.find_one({"id": visit_id}, {"_id": 0, "photo_data": 0})
+    return {"visit_id": visit_id, "admin_notes": updated.get("admin_notes", [])}
+
 # ---------- Statuses metadata ----------
 @api_router.get("/field/statuses")
 async def list_statuses():
@@ -710,7 +815,7 @@ async def contact(payload: ContactRequest):
     username = os.environ["SMTP_USERNAME"]
     password = os.environ["SMTP_APP_PASSWORD"]
     to_email = os.environ["COMPANY_EMAIL"]
-    company = os.environ.get("COMPANY_NAME", "Maria Glass & Plywood")
+    company = os.environ.get("COMPANY_NAME", "Maria Glass & Plywoods")
 
     msg = EmailMessage()
     msg["Subject"] = f"[{company} Website] {payload.subject or 'Contact Enquiry'}"
@@ -754,7 +859,7 @@ async def contact(payload: ContactRequest):
 
 @api_router.get("/")
 async def root():
-    return {"message": "Maria Glass & Plywood API"}
+    return {"message": "Maria Glass & Plywoods API"}
 
 # ---------- Startup ----------
 @app.on_event("startup")
